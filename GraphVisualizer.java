@@ -269,44 +269,48 @@ public class GraphVisualizer extends JFrame {
         }
     }
 
-   private void pruneNetwork() {
-    // 1. Build the adjacency map ONCE at the start
-    Map<Node, List<Edge>> adjMap = buildAdjacencyMap();
-    
-    // 2. Iterate over a copy of the edges directly to avoid concurrent modification 
-    // and to ensure each edge is evaluated exactly once
-    List<Edge> edgesToTest = new ArrayList<>(graph.edges);
-    
-    for (Edge e : edgesToTest) {
-        Node source = e.from;
-        Node target = e.to;
-        
-        // 3. Temporarily isolate the edge from the graph and our local map
-        graph.edges.remove(e);
-        if (adjMap.containsKey(source)) adjMap.get(source).remove(e);
-        if (!graph.directed && adjMap.containsKey(target)) {
-            adjMap.get(target).remove(e);
-        }
-        
-        // 4. CRITICAL: Use a silent, non-animated version of A* for background computation!
-        PathResult path = animatedAStar(source, target, HeuristicMode.NORMAL,false, adjMap);
-        
-        // 5. If there is no detour, or the detour is worse than 1.1x the original weight, KEEP it.
-        if (path.path == null || path.totalCost >= 1.1 * e.getWeight()) {
-            graph.edges.add(e);
-            if (adjMap.containsKey(source)) adjMap.get(source).add(e);
+    private void pruneNetwork() {
+        // 1. Build the adjacency map ONCE at the start
+        Map<Node, List<Edge>> adjMap = buildAdjacencyMap();
+
+        // 2. Iterate over a copy of the edges directly to avoid concurrent modification
+        // and to ensure each edge is evaluated exactly once
+        List<Edge> edgesToTest = new ArrayList<>(graph.edges);
+
+        for (Edge e : edgesToTest) {
+            Node source = e.from;
+            Node target = e.to;
+
+            // 3. Temporarily isolate the edge from the graph and our local map
+            graph.edges.remove(e);
+            if (adjMap.containsKey(source))
+                adjMap.get(source).remove(e);
             if (!graph.directed && adjMap.containsKey(target)) {
-                adjMap.get(target).add(e);
+                adjMap.get(target).remove(e);
+            }
+
+            // 4. CRITICAL: Use a silent, non-animated version of A* for background
+            // computation!
+            PathResult path = animatedAStar(source, target, HeuristicMode.NORMAL, false, adjMap);
+
+            // 5. If there is no detour, or the detour is worse than 1.1x the original
+            // weight, KEEP it.
+            if (path.path == null || path.totalCost >= 1.1 * e.getWeight()) {
+                graph.edges.add(e);
+                if (adjMap.containsKey(source))
+                    adjMap.get(source).add(e);
+                if (!graph.directed && adjMap.containsKey(target)) {
+                    adjMap.get(target).add(e);
+                }
             }
         }
+
+        // 6. Trigger UI updates exactly ONCE after the entire batch is complete
+        updateMaxSpeed();
+        saveGraph();
+        canvas.revalidate();
+        canvas.repaint();
     }
-    
-    // 6. Trigger UI updates exactly ONCE after the entire batch is complete
-    updateMaxSpeed();
-    saveGraph();
-    canvas.revalidate();
-    canvas.repaint();
-}
 
     private Node findNodeById(String id) {
         for (Node n : graph.nodes)
@@ -504,25 +508,21 @@ public class GraphVisualizer extends JFrame {
 
         // 3. SUGGESTED Heuristic (Clamped + Dynamic Blend)
         if (mode == HeuristicMode.SUGGESTED) {
-            // Safe origin buffer
-            if (travelled < 50.0) {
+            if (travelled < 25.0)
                 return hNormal;
-            }
 
             double currentSlowness = tentative / travelled;
+            double maxSlownessCap = 4.5 / maxSpeed; // Keep it highly aggressive/fast
 
-            // Dampen extreme outliers (Max out at 3x slower than ideal speed)
-            double maxAllowedSlowness = 3.0 / maxSpeed;
-            double minAllowedSlowness = 1.0 / maxSpeed;
-            currentSlowness = Math.max(minAllowedSlowness, Math.min(currentSlowness, maxAllowedSlowness));
+            if (currentSlowness > maxSlownessCap) {
+                currentSlowness = maxSlownessCap;
+            }
 
-            double hAdapted = Graph.distance(node, goal) * currentSlowness;
+            double hSuggested = Graph.distance(node, goal) * currentSlowness;
 
-            // Linear interpolation blend based on journey progress
-            double totalEstimatedDist = travelled + Graph.distance(node, goal);
-            double progressRatio = travelled / totalEstimatedDist;
-
-            return (1.0 - progressRatio) * hAdapted + (progressRatio * hNormal);
+            // THE FIX: Never allow the heuristic to guess worse than 1.8x the ideal speed.
+            // This physically prevents a 200% error spike from ever formatting.
+            return Math.min(hSuggested, hNormal * 1.8);
         }
 
         return hNormal;
@@ -559,6 +559,8 @@ public class GraphVisualizer extends JFrame {
         closedNodes.clear();
         finalPath.clear();
         finalPathNormal.clear();
+        updatePathEdges();
+        repaint();
 
         String startId = JOptionPane.showInputDialog(this, "Start node ID:");
         if (startId == null)
@@ -587,7 +589,7 @@ public class GraphVisualizer extends JFrame {
             finalPath.clear();
             finalPathNormal.clear();
 
-            PathResult adapted = animatedAStar(start, goal, HeuristicMode.ADAPTED, true, adjMap);
+            PathResult adapted = animatedAStar(start, goal, HeuristicMode.SUGGESTED, true, adjMap);
 
             SwingUtilities.invokeLater(() -> {
                 finalPath.clear();
@@ -600,7 +602,7 @@ public class GraphVisualizer extends JFrame {
                 updatePathEdges();
                 String message = "NORMAL A*\nNodes considered: " + normal.nodesConsidered + "\n" +
                         String.format("Travel time: %.2f\n\n", normal.totalCost) +
-                        "ADAPTED A*\nNodes considered: " + adapted.nodesConsidered + "\n" +
+                        "Suggested A*\nNodes considered: " + adapted.nodesConsidered + "\n" +
                         String.format("Travel time: %.2f\n\n", adapted.totalCost) +
                         "Difference in nodes considered: " + (normal.nodesConsidered - adapted.nodesConsidered);
 
@@ -618,7 +620,7 @@ public class GraphVisualizer extends JFrame {
         }
 
         final JDialog progress = new JDialog(this, "Analyzing...", false);
-        progress.add(new JLabel("  Running 3-way A* performance analysis...  "));
+        progress.add(new JLabel("   Running 3-way A* performance analysis...   "));
         progress.pack();
         progress.setLocationRelativeTo(this);
         progress.setDefaultCloseOperation(JDialog.DO_NOTHING_ON_CLOSE);
@@ -637,6 +639,11 @@ public class GraphVisualizer extends JFrame {
             long countShort = 0, normShort = 0, adaptShort = 0, suggShort = 0;
             long countMed = 0, normMed = 0, adaptMed = 0, suggMed = 0;
             long countLong = 0, normLong = 0, adaptLong = 0, suggLong = 0;
+
+            // NEW: Track sum of cost errors for each bucket to compute averages
+            double errorAdaptShortSum = 0.0, errorSuggShortSum = 0.0;
+            double errorAdaptMedSum = 0.0, errorSuggMedSum = 0.0;
+            double errorAdaptLongSum = 0.0, errorSuggLongSum = 0.0;
 
             // Index 0: 0-10%, Index 1: 10-20% ... Index 10: >100%
             int[] adaptedDistribution = new int[11];
@@ -702,34 +709,47 @@ public class GraphVisualizer extends JFrame {
                         suggestedDistribution[bucketIndex]++;
                     }
 
-                    // Evaluate Optimality Loss against the ground truth (NORMAL)
+                    // NEW: Calculate cost error percentages for this specific pair
+                    // Guarding against negative values from minor floating-point inaccuracies
+                    double errorAdapted = normal.totalCost > 0
+                            ? Math.max(0.0, ((adapted.totalCost - normal.totalCost) / normal.totalCost) * 100.0)
+                            : 0.0;
+                    double errorSuggested = normal.totalCost > 0
+                            ? Math.max(0.0, ((suggested.totalCost - normal.totalCost) / normal.totalCost) * 100.0)
+                            : 0.0;
+
+                    // Evaluate Global Optimality Loss against the ground truth (NORMAL)
                     if (adapted.totalCost > normal.totalCost + 1e-6) {
                         subOptAdapted++;
-                        double error = ((adapted.totalCost - normal.totalCost) / normal.totalCost) * 100.0;
-                        maxErrorAdapted = Math.max(maxErrorAdapted, error);
+                        maxErrorAdapted = Math.max(maxErrorAdapted, errorAdapted);
                     }
                     if (suggested.totalCost > normal.totalCost + 1e-6) {
                         subOptSuggested++;
-                        double error = ((suggested.totalCost - normal.totalCost) / normal.totalCost) * 100.0;
-                        maxErrorSuggested = Math.max(maxErrorSuggested, error);
+                        maxErrorSuggested = Math.max(maxErrorSuggested, errorSuggested);
                     }
 
-                    // Sorting into distance buckets
+                    // Sorting into distance buckets and accumulating cost errors
                     if (hops < 5) {
                         countShort++;
                         normShort += normal.nodesConsidered;
                         adaptShort += adapted.nodesConsidered;
                         suggShort += suggested.nodesConsidered;
+                        errorAdaptShortSum += errorAdapted;
+                        errorSuggShortSum += errorSuggested;
                     } else if (hops < 10) {
                         countMed++;
                         normMed += normal.nodesConsidered;
                         adaptMed += adapted.nodesConsidered;
                         suggMed += suggested.nodesConsidered;
+                        errorAdaptMedSum += errorAdapted;
+                        errorSuggMedSum += errorSuggested;
                     } else {
                         countLong++;
                         normLong += normal.nodesConsidered;
                         adaptLong += adapted.nodesConsidered;
                         suggLong += suggested.nodesConsidered;
+                        errorAdaptLongSum += errorAdapted;
+                        errorSuggLongSum += errorSuggested;
                     }
                 }
             }
@@ -761,9 +781,14 @@ public class GraphVisualizer extends JFrame {
 
             r.append("------------------------------------------------------------\n");
             r.append("PERFORMANCE BY JOURNEY LENGTH:\n\n");
-            appendBucketMetric(r, "Short Range (1-4 Hops)", countShort, normShort, adaptShort, suggShort);
-            appendBucketMetric(r, "Mid Range (5-9 Hops)", countMed, normMed, adaptMed, suggMed);
-            appendBucketMetric(r, "Long Range (10+ Hops)", countLong, normLong, adaptLong, suggLong);
+
+            // NEW: Pass the accumulated error sums into the reporting method
+            appendBucketMetric(r, "Short Range (1-4 Hops)", countShort, normShort, adaptShort, suggShort,
+                    errorAdaptShortSum, errorSuggShortSum);
+            appendBucketMetric(r, "Mid Range (5-9 Hops)", countMed, normMed, adaptMed, suggMed, errorAdaptMedSum,
+                    errorSuggMedSum);
+            appendBucketMetric(r, "Long Range (10+ Hops)", countLong, normLong, adaptLong, suggLong, errorAdaptLongSum,
+                    errorSuggLongSum);
 
             System.out.println("\n--- ERROR DISTRIBUTION (Suboptimal routes only) ---");
 
@@ -801,16 +826,29 @@ public class GraphVisualizer extends JFrame {
         return ((double) (base - target) / base) * 100.0;
     }
 
-    private void appendBucketMetric(StringBuilder r, String title, long count, long norm, long adapt, long sugg) {
+    private void appendBucketMetric(StringBuilder sb, String bucketName, long count,
+            long normNodes, long adaptNodes, long suggNodes,
+            double adaptErrorSum, double suggErrorSum) {
+        sb.append(bucketName).append(String.format(" (%,d routes):\n", count));
         if (count == 0) {
-            r.append(String.format("%s: No routes found\n\n", title));
+            sb.append("  No routes fell within this range.\n\n");
             return;
         }
-        r.append(String.format("%s (%,d routes total):\n", title, count));
-        r.append(String.format("  Avg Nodes Checked -> Normal: %,d | Adapted: %,d | Suggested: %,d\n", norm / count,
-                adapt / count, sugg / count));
-        r.append(String.format("  Work Saved vs Base-> Adapted: %.1f%% | Suggested: %.1f%%\n\n",
-                getSavedPct(norm, adapt), getSavedPct(norm, sugg)));
+
+        // Calculate average workload nodes looked at
+        double avgNorm = (double) normNodes / count;
+        double avgAdapt = (double) adaptNodes / count;
+        double avgSugg = (double) suggNodes / count;
+
+        // Calculate average path cost error percentage compared to baseline
+        double avgAdaptError = adaptErrorSum / count;
+        double avgSuggError = suggErrorSum / count;
+
+        sb.append(String.format(
+                "  * Avg Workload -> NORMAL: %.1f | ADAPTED: %.1f (Saved %.1f%%) | SUGGESTED: %.1f (Saved %.1f%%)\n",
+                avgNorm, avgAdapt, getSavedPct(normNodes, adaptNodes), avgSugg, getSavedPct(normNodes, suggNodes)));
+        sb.append(String.format("  * Avg Path Cost Error -> ADAPTED: %.3f%% longer | SUGGESTED: %.3f%% longer\n\n",
+                avgAdaptError, avgSuggError));
     }
 
     private PathResult animatedAStar(Node start, Node goal, HeuristicMode mode, boolean animate,
